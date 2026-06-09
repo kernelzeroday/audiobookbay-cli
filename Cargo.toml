@@ -1,0 +1,16 @@
+[package]
+name = "audiobookbay"
+version = "0.1.0"
+edition = "2021"
+license = "WTFPL"
+authors = ["kernelzeroday"]
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+reqwest = { version = "0.12", features = ["blocking", "cookies"] }
+scraper = "0.22"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
