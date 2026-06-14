@@ -7,11 +7,20 @@ use serde::Deserialize;
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-const DEFAULT_BASE_URL: &str = "https://audiobookbay.lu";
+const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+const MIRRORS: &[&str] = &[
+    "https://audiobookbay.lu",
+    "https://audiobookbay.se",
+    "https://audiobookbay.nl",
+    "https://audiobookbay.li",
+    "https://audiobookbay.is",
+    "https://audiobookbay.fi",
+];
 
 #[derive(Parser)]
 #[command(name = "audiobookbay", about = "Search AudioBookBay for audiobook torrents")]
@@ -50,6 +59,14 @@ struct Cli {
     /// HTTP/SOCKS5 proxy URL (HTTPS_PROXY / ALL_PROXY env vars also respected)
     #[arg(long)]
     proxy: Option<String>,
+
+    /// Number of parallel detail-fetch threads
+    #[arg(short, long, default_value = "4")]
+    jobs: usize,
+
+    /// Delay in milliseconds between detail-page requests (per thread)
+    #[arg(long, default_value = "500")]
+    delay: u64,
 }
 
 #[derive(Deserialize)]
@@ -70,6 +87,7 @@ struct Audiobook {
     torrent_url: String,
 }
 
+#[derive(Debug)]
 struct DetailInfo {
     info_hash: String,
     trackers: Vec<String>,
@@ -94,6 +112,17 @@ fn config_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from(".config"))
         .join("audiobookbay")
+}
+
+fn session_path_for(base_url: &str) -> PathBuf {
+    let host = base_url
+        .strip_prefix("https://")
+        .or_else(|| base_url.strip_prefix("http://"))
+        .unwrap_or(base_url)
+        .split('/')
+        .next()
+        .unwrap_or("default");
+    config_dir().join(format!("session.{}", host))
 }
 
 fn session_path() -> PathBuf {
@@ -139,17 +168,109 @@ fn load_config() -> Result<Config> {
     Ok(config)
 }
 
-fn save_session(cookie: &str) -> Result<()> {
+fn save_session(base_url: &str, cookie: &str) -> Result<()> {
     let dir = config_dir();
     fs::create_dir_all(&dir)?;
-    fs::write(session_path(), cookie)?;
+    fs::write(session_path_for(base_url), cookie)?;
+    let _ = fs::write(session_path(), cookie);
     Ok(())
 }
 
-fn load_session() -> Option<String> {
-    fs::read_to_string(session_path())
+fn load_session(base_url: &str) -> Option<String> {
+    fs::read_to_string(session_path_for(base_url))
+        .or_else(|_| fs::read_to_string(session_path()))
         .ok()
         .filter(|s| !s.trim().is_empty())
+}
+
+fn mirror_path() -> PathBuf {
+    config_dir().join("mirror")
+}
+
+fn save_mirror(url: &str) {
+    let _ = fs::create_dir_all(config_dir());
+    let _ = fs::write(mirror_path(), url);
+}
+
+fn load_mirror() -> Option<String> {
+    fs::read_to_string(mirror_path())
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
+}
+
+fn is_valid_abb_html(html: &str) -> bool {
+    let lower = html.to_lowercase();
+    lower.contains("audiobookbay") || lower.contains("audiobook bay") || lower.contains("member/login")
+}
+
+fn probe_mirrors(proxy: Option<&str>, quiet: bool) -> Result<String> {
+    if let Some(cached) = load_mirror() {
+        let mut builder = Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(6));
+        if let Some(p) = proxy {
+            if let Ok(px) = reqwest::Proxy::all(p) {
+                builder = builder.no_proxy().proxy(px);
+            }
+        }
+        if let Ok(client) = builder.build() {
+            if let Ok(resp) = client.get(&cached).send() {
+                if let Ok(html) = resp.text() {
+                    if is_valid_abb_html(&html) {
+                        return Ok(cached);
+                    }
+                }
+            }
+        }
+        if !quiet {
+            eprintln!("Cached mirror {} unreachable, probing others...", cached);
+        }
+    }
+
+    let winner: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    thread::scope(|s| {
+        for &mirror in MIRRORS {
+            let winner = Arc::clone(&winner);
+            s.spawn(move || {
+                if winner.lock().unwrap().is_some() {
+                    return;
+                }
+                let mut builder = Client::builder()
+                    .user_agent(USER_AGENT)
+                    .timeout(Duration::from_secs(20))
+                    .connect_timeout(Duration::from_secs(15));
+                if let Some(p) = proxy {
+                    if let Ok(px) = reqwest::Proxy::all(p) {
+                        builder = builder.no_proxy().proxy(px);
+                    }
+                }
+                if let Ok(client) = builder.build() {
+                    if let Ok(resp) = client.get(mirror).send() {
+                        if let Ok(html) = resp.text() {
+                            if is_valid_abb_html(&html) {
+                                let mut w = winner.lock().unwrap();
+                                if w.is_none() {
+                                    *w = Some(mirror.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let result = winner.lock().unwrap().clone();
+    match result {
+        Some(url) => {
+            save_mirror(&url);
+            Ok(url)
+        }
+        None => bail!("No reachable AudioBookBay mirror found. Try --base-url or --proxy."),
+    }
 }
 
 fn build_client(
@@ -166,7 +287,7 @@ fn build_client(
 
     let mut builder = Client::builder()
         .cookie_provider(jar)
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+        .user_agent(USER_AGENT)
         .redirect(reqwest::redirect::Policy::limited(10))
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(10));
@@ -180,16 +301,12 @@ fn build_client(
     builder.build().context("Failed to build HTTP client")
 }
 
-fn is_logged_in(html: &str) -> bool {
-    html.contains("member/logout") || html.contains("You are logged in")
-}
-
 fn login(base_url: &str, config: &Config, proxy: Option<&str>) -> Result<String> {
     let mut builder = Client::builder()
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+        .user_agent(USER_AGENT)
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(15))
-        .connect_timeout(Duration::from_secs(10));
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(15));
 
     if let Some(proxy_url) = proxy {
         builder = builder
@@ -300,30 +417,8 @@ fn ensure_logged_in(
     proxy: Option<&str>,
 ) -> Result<Client> {
     if !force_login {
-        if let Some(session) = load_session() {
-            let client = build_client(base_url, Some(&session), proxy)?;
-            if !quiet {
-                eprint!("Checking session... ");
-            }
-            match client.get(format!("{}/", base_url)).send() {
-                Ok(resp) => {
-                    let html = resp.text().unwrap_or_default();
-                    if is_logged_in(&html) {
-                        if !quiet {
-                            eprintln!("ok");
-                        }
-                        return Ok(client);
-                    }
-                    if !quiet {
-                        eprintln!("expired");
-                    }
-                }
-                Err(_) => {
-                    if !quiet {
-                        eprintln!("failed");
-                    }
-                }
-            }
+        if let Some(session) = load_session(base_url) {
+            return build_client(base_url, Some(&session), proxy);
         }
     }
 
@@ -331,7 +426,7 @@ fn ensure_logged_in(
         eprint!("Logging in... ");
     }
     let session = login(base_url, config, proxy)?;
-    let _ = save_session(&session);
+    let _ = save_session(base_url, &session);
     let client = build_client(base_url, Some(&session), proxy)?;
     if !quiet {
         eprintln!("ok");
@@ -375,8 +470,10 @@ fn search(client: &Client, base_url: &str, query: &str, page: usize) -> Result<S
     let final_url = resp.url().to_string();
     let html = resp.text()?;
 
-    // Redirected away from search — site returned homepage instead of results
     if !final_url.contains("?s=") && !final_url.contains("&s=") {
+        if final_url.contains("login") {
+            bail!("session_expired");
+        }
         return Ok(String::new());
     }
 
@@ -630,14 +727,24 @@ fn main() -> Result<()> {
     }
 
     let mut config = load_config()?;
-    let base_url = cli
-        .base_url
-        .or(config.base_url.take())
-        .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+    let proxy = cli.proxy.as_deref();
+    let explicit_url = cli.base_url.or(config.base_url.take());
+    let base_url = match explicit_url {
+        Some(url) => url,
+        None => {
+            if !quiet {
+                eprint!("Finding mirror... ");
+            }
+            let url = probe_mirrors(proxy, quiet)?;
+            if !quiet {
+                eprintln!("{}", url);
+            }
+            url
+        }
+    };
     let base_url = base_url.trim_end_matches('/').to_string();
 
-    let proxy = cli.proxy.as_deref();
-    let client = ensure_logged_in(&base_url, &config, cli.relogin, quiet, proxy)?;
+    let mut client = ensure_logged_in(&base_url, &config, cli.relogin, quiet, proxy)?;
 
     let query = cli.query.join(" ");
 
@@ -651,9 +758,22 @@ fn main() -> Result<()> {
                 eprint!("Searching... ");
             }
         }
-        let html = with_retry(cli.retries, quiet, || {
+        let search_result = with_retry(cli.retries, quiet, || {
             search(&client, &base_url, &query, page)
-        })?;
+        });
+        let html = match search_result {
+            Ok(html) => html,
+            Err(e) if e.to_string().contains("session_expired") => {
+                if !quiet {
+                    eprintln!("session expired, re-logging in...");
+                }
+                client = ensure_logged_in(&base_url, &config, true, quiet, proxy)?;
+                with_retry(cli.retries, quiet, || {
+                    search(&client, &base_url, &query, page)
+                })?
+            }
+            Err(e) => return Err(e),
+        };
         let results = parse_results(&html, cli.limit.saturating_sub(all_results.len()));
         let count = results.len();
         all_results.extend(results);
@@ -671,74 +791,114 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let torrent_dir = cli.torrent_dir.as_deref();
-    if let Some(dir) = torrent_dir {
+    let torrent_dir = cli.torrent_dir.clone();
+    if let Some(ref dir) = torrent_dir {
         fs::create_dir_all(dir).context("Failed to create torrent directory")?;
     }
 
     let total = all_results.len();
-    for (i, book) in all_results.iter_mut().enumerate() {
-        if book.detail_url.is_empty() {
-            continue;
+    let jobs = cli.jobs.max(1).min(total);
+    let retries = cli.retries;
+    let delay = Duration::from_millis(cli.delay);
+    let done = Arc::new(Mutex::new(0usize));
+
+    let work: Vec<_> = all_results
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| !b.detail_url.is_empty())
+        .map(|(i, b)| (i, b.detail_url.clone(), b.title.clone()))
+        .collect();
+
+    let chunks: Vec<Vec<_>> = {
+        let mut ch: Vec<Vec<_>> = (0..jobs).map(|_| Vec::new()).collect();
+        for (idx, item) in work.into_iter().enumerate() {
+            ch[idx % jobs].push(item);
         }
-        if !quiet && is_tty {
-            eprint!("\rFetching details ({}/{})... ", i + 1, total);
+        ch
+    };
+
+    let results_map: Arc<Mutex<Vec<(usize, Result<DetailInfo>)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+
+    thread::scope(|s| {
+        for chunk in &chunks {
+            if chunk.is_empty() {
+                continue;
+            }
+            let client = &client;
+            let base_url = &base_url;
+            let done = Arc::clone(&done);
+            let results_map = Arc::clone(&results_map);
+            s.spawn(move || {
+                for (ci, &(i, ref detail_url, ref _title)) in chunk.iter().enumerate() {
+                    if ci > 0 && !delay.is_zero() {
+                        thread::sleep(delay);
+                    }
+                    let detail_url = detail_url.clone();
+                    let result = with_retry(retries, true, || {
+                        fetch_detail_info(client, base_url, &detail_url)
+                    });
+                    results_map.lock().unwrap().push((i, result));
+                    let mut d = done.lock().unwrap();
+                    *d += 1;
+                    if !quiet && is_tty {
+                        eprint!("\rFetching details ({}/{})... ", *d, total);
+                    }
+                }
+            });
         }
-        let detail_url = book.detail_url.clone();
-        let detail_result = with_retry(cli.retries, quiet, || {
-            fetch_detail_info(&client, &base_url, &detail_url)
-        });
-        match detail_result {
+    });
+
+    if !quiet && is_tty {
+        eprint!("\r");
+    }
+
+    let detail_results = Arc::try_unwrap(results_map).unwrap().into_inner().unwrap();
+    let mut failed = 0usize;
+    for (i, result) in detail_results {
+        match result {
             Ok(detail) => {
+                let book = &mut all_results[i];
                 book.magnet =
                     magnet_from_hash(&detail.info_hash, &book.title, &detail.trackers);
                 book.torrent_url = detail.torrent_url;
-
-                if let Some(dir) = torrent_dir {
-                    if !book.torrent_url.is_empty() {
-                        let torrent_url = book.torrent_url.clone();
-                        let title = book.title.clone();
-                        match with_retry(cli.retries, quiet, || {
-                            download_torrent(&client, &torrent_url, dir, &title)
-                        }) {
-                            Ok(path) => {
-                                if !quiet {
-                                    if is_tty {
-                                        eprintln!("\r  Saved: {}", path.display());
-                                    } else {
-                                        eprintln!("  Saved: {}", path.display());
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                if !quiet {
-                                    if is_tty {
-                                        eprintln!("\r  Torrent download failed: {}", e);
-                                    } else {
-                                        eprintln!("  Torrent download failed: {}", e);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
             }
-            Err(e) => {
-                if !quiet {
-                    if is_tty {
-                        eprintln!("\r  Detail fetch failed: {}", e);
-                    } else {
-                        eprintln!("  Detail fetch failed: {}", e);
-                    }
-                }
+            Err(_) => {
+                failed += 1;
             }
         }
     }
+
     if !quiet && total > 0 {
-        if is_tty {
-            eprintln!("\rFetched {} details.{}", total, " ".repeat(20));
+        let msg = if failed > 0 {
+            format!("Fetched {} details ({} failed).", total, failed)
         } else {
-            eprintln!("Fetched {} details.", total);
+            format!("Fetched {} details.", total)
+        };
+        eprintln!("{}{}", msg, if is_tty { " ".repeat(20) } else { String::new() });
+    }
+
+    if let Some(ref dir) = torrent_dir {
+        for book in &all_results {
+            if book.torrent_url.is_empty() {
+                continue;
+            }
+            let torrent_url = book.torrent_url.clone();
+            let title = book.title.clone();
+            match with_retry(retries, quiet, || {
+                download_torrent(&client, &torrent_url, dir, &title)
+            }) {
+                Ok(path) => {
+                    if !quiet {
+                        eprintln!("  Saved: {}", path.display());
+                    }
+                }
+                Err(e) => {
+                    if !quiet {
+                        eprintln!("  Torrent download failed: {}", e);
+                    }
+                }
+            }
         }
     }
 
