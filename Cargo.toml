@@ -8,7 +8,7 @@ authors = ["kernelzeroday"]
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
 reqwest = { version = "0.12", features = ["blocking", "cookies"] }
 scraper = "0.22"
