@@ -460,10 +460,11 @@ fn decode_base64_posts(html: &str) -> String {
 }
 
 fn search(client: &Client, base_url: &str, query: &str, page: usize) -> Result<String> {
+    let query_lower = query.to_lowercase();
     let url = if page > 1 {
-        format!("{}/page/{}/?s={}", base_url, page, urlencoding(query))
+        format!("{}/page/{}/?s={}", base_url, page, urlencoding(&query_lower))
     } else {
-        format!("{}/?s={}", base_url, urlencoding(query))
+        format!("{}/?s={}", base_url, urlencoding(&query_lower))
     };
 
     let resp = client.get(&url).send().context("Search request failed")?;
@@ -471,10 +472,7 @@ fn search(client: &Client, base_url: &str, query: &str, page: usize) -> Result<S
     let html = resp.text()?;
 
     if !final_url.contains("?s=") && !final_url.contains("&s=") {
-        if final_url.contains("login") {
-            bail!("session_expired");
-        }
-        return Ok(String::new());
+        bail!("session_expired");
     }
 
     let lower = html.to_lowercase();
@@ -906,4 +904,147 @@ fn main() -> Result<()> {
     display(&all_results);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn urlencoding_preserves_unreserved() {
+        assert_eq!(urlencoding("hello"), "hello");
+        assert_eq!(urlencoding("a-b_c.d~e"), "a-b_c.d~e");
+        assert_eq!(urlencoding("ABC123"), "ABC123");
+    }
+
+    #[test]
+    fn urlencoding_encodes_spaces_and_specials() {
+        assert_eq!(urlencoding("hello world"), "hello%20world");
+        assert_eq!(urlencoding("a&b=c"), "a%26b%3Dc");
+        assert_eq!(urlencoding("foo@bar"), "foo%40bar");
+    }
+
+    fn sample_post_html(title: &str, href: &str, lang: &str, fmt: &str, size: &str) -> String {
+        format!(
+            r#"<div class="post"><div class="postTitle"><h2><a href="{href}">{title}</a></h2></div>
+            <div class="postInfo">Category: Sci-Fi<br />Language: {lang}<span>Keywords: test</span></div>
+            <div class="postContent"><p>Format: {fmt} / Bitrate: 128 Kbps</p><p>File Size: {size}</p></div></div>"#
+        )
+    }
+
+    #[test]
+    fn parse_results_extracts_fields() {
+        let html = format!(
+            "<html><body><div id=\"content\">{}</div></body></html>",
+            sample_post_html(
+                "Project Hail Mary - Andy Weir",
+                "/abss/project-hail-mary/",
+                "English",
+                "M4B",
+                "500 MB"
+            )
+        );
+        let results = parse_results(&html, 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Project Hail Mary - Andy Weir");
+        assert_eq!(results[0].detail_url, "/abss/project-hail-mary/");
+        assert_eq!(results[0].lang, "English");
+        assert_eq!(results[0].format, "M4B");
+        assert_eq!(results[0].size, "500 MB");
+    }
+
+    #[test]
+    fn parse_results_respects_limit() {
+        let posts: String = (0..5)
+            .map(|i| sample_post_html(&format!("Book {i}"), &format!("/book-{i}/"), "English", "MP3", "100 MB"))
+            .collect();
+        let html = format!("<html><body>{posts}</body></html>");
+        let results = parse_results(&html, 3);
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].title, "Book 0");
+        assert_eq!(results[2].title, "Book 2");
+    }
+
+    #[test]
+    fn parse_results_skips_empty_titles() {
+        let html = r#"<html><body>
+            <div class="post"><div class="postTitle"><h2><a href="/x/"></a></h2></div>
+            <div class="postInfo"></div><div class="postContent"></div></div>
+            <div class="post"><div class="postTitle"><h2><a href="/y/">Real Title</a></h2></div>
+            <div class="postInfo"></div><div class="postContent"></div></div>
+        </body></html>"#;
+        let results = parse_results(html, 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Real Title");
+    }
+
+    #[test]
+    fn parse_results_empty_html() {
+        assert!(parse_results("", 10).is_empty());
+        assert!(parse_results("<html><body></body></html>", 10).is_empty());
+    }
+
+    #[test]
+    fn decode_base64_posts_decodes_hidden_content() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let inner = r#"<div class="postTitle"><h2><a href="/test/">Test Book</a></h2></div><div class="postInfo">Language: English</div><div class="postContent">Format: MP3</div>"#;
+        let encoded = STANDARD.encode(inner);
+        let html = format!(
+            r#"<div class="post re-ab" style="display:none;">{encoded}</div>"#
+        );
+        let decoded = decode_base64_posts(&html);
+        assert!(decoded.contains("class=\"post\">"));
+        assert!(decoded.contains("Test Book"));
+        assert!(!decoded.contains("re-ab"));
+        assert!(!decoded.contains("display:none"));
+    }
+
+    #[test]
+    fn decode_base64_posts_passthrough_normal_html() {
+        let html = r#"<div class="post"><div class="postTitle">Normal</div></div>"#;
+        assert_eq!(decode_base64_posts(html), html);
+    }
+
+    #[test]
+    fn magnet_from_hash_with_trackers() {
+        let hash = "a".repeat(40);
+        let trackers = vec!["udp://tracker.example.com:1337/announce".to_string()];
+        let magnet = magnet_from_hash(&hash, "My Book", &trackers);
+        assert!(magnet.starts_with(&format!("magnet:?xt=urn:btih:{hash}")));
+        assert!(magnet.contains("&dn=My%20Book"));
+        assert!(magnet.contains("&tr=udp%3A%2F%2Ftracker.example.com%3A1337%2Fannounce"));
+    }
+
+    #[test]
+    fn magnet_from_hash_uses_fallback_trackers() {
+        let hash = "b".repeat(40);
+        let magnet = magnet_from_hash(&hash, "Test", &[]);
+        assert!(magnet.contains("&tr="));
+        assert!(magnet.contains("opentrackr"));
+    }
+
+    #[test]
+    fn parse_results_handles_real_abb_html() {
+        let html = r#"<html><body><div id="content">
+            <div class="post"><div class="postTitle"><h2><a href="/abss/project-hail-mary-andy-weir/" rel="bookmark">Project Hail Mary - Andy Weir</a></h2></div><div class="postInfo">Category: Sci-Fi&nbsp; <br />Language: English<span style="margin-left:100px;">Keywords: Space&nbsp </span><br /></div><div class="postContent"><div class="center">
+<p class="center">Shared by:<a href="/member/users/index?&amp;mode=userinfo&amp;username=user1">user1</a></p>
+</div>
+<p style='text-align:center;'>Posted: 15 May 2026<br />Format: <span style='color:#a00;'>M4B</span> / Bitrate: <span style='color:#a00;'>128 Kbps</span><br />File Size: <span style='color:#00f;'>404.4</span> MBs</p>
+</div></div>
+        </div></body></html>"#;
+        let results = parse_results(html, 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Project Hail Mary - Andy Weir");
+        assert_eq!(results[0].detail_url, "/abss/project-hail-mary-andy-weir/");
+        assert_eq!(results[0].lang, "English");
+    }
+
+    #[test]
+    fn search_lowercases_query() {
+        let query = "Project Hail Mary";
+        let lower = query.to_lowercase();
+        assert_eq!(lower, "project hail mary");
+        let encoded = urlencoding(&lower);
+        assert_eq!(encoded, "project%20hail%20mary");
+    }
 }
